@@ -1,0 +1,91 @@
+name: Minecraft Pro Transfer (PortableMC Python)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mc_version:
+        description: 'نسخه ماینکرفت (مثلا 1.21.1 یا fabric:1.21.1)'
+        required: true
+        default: 'fabric:1.21.1'
+      zip_password:
+        description: 'رمز عبور برای فایل ۷زد'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install PortableMC & 7z
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          # نصب نسخه پایتونی طبق مستندات شما
+          pip install "portablemc[certifi]"
+
+      - name: Download Minecraft Environment
+        id: dl
+        run: |
+          mkdir -p mc_data
+          # استفاده از --dry برای فقط دانلود و --main-dir برای تعیین مسیر
+          # استفاده از --output machine برای لاگ تمیزتر در گیت‌هاب
+          portablemc --main-dir ./mc_data --output machine start --dry ${{ github.event.inputs.mc_version }}
+          
+          # آماده‌سازی نام آرشیو (جایگزینی کاراکترهای غیرمجاز)
+          SAFE_NAME=$(echo "${{ github.event.inputs.mc_version }}" | sed 's/[:\/]/_/g')
+          echo "archive_base=mc_archive_${SAFE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Create Encrypted Split Archive
+        run: |
+          ARCHIVE_NAME="${{ steps.dl.outputs.archive_base }}"
+          # ساخت آرشیو چند تکه با رمز عبور و پارت‌های 85 مگابایتی
+          # تمام محتویات پوشه mc_data شامل assets و libraries فشرده می‌شوند
+          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=3 -v85m "${ARCHIVE_NAME}.7z" "./mc_data/*"
+
+      - name: Configure Git & Push Chunks
+        run: |
+          ARCHIVE_NAME="${{ steps.dl.outputs.archive_base }}"
+          
+          # تنظیمات گیت
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+          # جابجایی پارت‌ها به یک پوشه مشخص در ریپو
+          mkdir -p "downloads/${ARCHIVE_NAME}"
+          mv ${ARCHIVE_NAME}.7z.* "downloads/${ARCHIVE_NAME}/" 2>/dev/null || mv ${ARCHIVE_NAME}.7z "downloads/${ARCHIVE_NAME}/"
+
+          git add "downloads/${ARCHIVE_NAME}/"
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "Add split MC files: ${ARCHIVE_NAME}"
+            
+            # مکانیزم Push مطمئن با Retry
+            success=false
+            for i in {1..10}; do
+              if git push origin HEAD; then
+                success=true
+                break
+              else
+                echo "Push failed, retrying..."
+                sleep 15
+                git fetch origin
+                git rebase origin/$(git rev-parse --abbrev-ref HEAD)
+              fi
+            done
+            
+            if [ "$success" = false ]; then
+              git push origin HEAD --force-with-lease
+            fi
+          else
+            echo "Nothing to upload."
+          fi
