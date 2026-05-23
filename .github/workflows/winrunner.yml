@@ -1,0 +1,97 @@
+name: WinRUNNER Minecraft Pro Transfer (PortableMC Python)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mc_version:
+        description: 'نسخه ماینکرفت (مثلا 1.21.1 یا fabric:1.21.1)'
+        required: true
+        default: 'fabric:1.21.1'
+      zip_password:
+        description: 'رمز عبور برای فایل ۷زد'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-sync:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install PortableMC
+        shell: powershell
+        run: |
+          pip install "portablemc[certifi]"
+
+      - name: Download Minecraft Environment
+        id: dl
+        shell: powershell
+        run: |
+          New-Item -Path "mc_data" -ItemType Directory -Force
+          # اجرای portablemc
+          portablemc --main-dir ./mc_data --output machine start --dry ${{ github.event.inputs.mc_version }}
+          
+          # آماده‌سازی نام آرشیو (جایگزینی کاراکترهای غیرمجاز)
+          $raw_version = "${{ github.event.inputs.mc_version }}"
+          $safe_name = $raw_version -replace '[:/]', '_'
+          echo "archive_base=mc_archive_$safe_name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create Encrypted Split Archive
+        shell: powershell
+        run: |
+          $archive_name = "${{ steps.dl.outputs.archive_base }}"
+          # ساخت آرشیو چند تکه با رمز عبور و پارت‌های 85 مگابایتی
+          # 7z در ویندوز به صورت پیش‌فرض در دسترس است
+          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=3 -v85m "$archive_name.7z" "./mc_data/*"
+
+      - name: Configure Git & Push Chunks
+        shell: powershell
+        run: |
+          $archive_name = "${{ steps.dl.outputs.archive_base }}"
+          
+          # تنظیمات گیت
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+          # جابجایی پارت‌ها به یک پوشه مشخص در ریپو
+          New-Item -Path "downloads/$archive_name" -ItemType Directory -Force
+          Move-Item -Path "$archive_name.7z.*" -Destination "downloads/$archive_name/" -ErrorAction SilentlyContinue
+          if (!(Test-Path "downloads/$archive_name/$archive_name.7z.001")) {
+            Move-Item -Path "$archive_name.7z" -Destination "downloads/$archive_name/" -ErrorAction SilentlyContinue
+          }
+
+          git add "downloads/$archive_name/"
+          
+          # بررسی تغییرات
+          $status = git status --porcelain
+          if ($status) {
+            git commit -m "Add split MC files: $archive_name"
+            
+            # مکانیزم Push مطمئن با Retry
+            $success = $false
+            for ($i=1; $i -le 10; $i++) {
+              git push origin HEAD
+              if ($LASTEXITCODE -eq 0) {
+                $success = $true
+                break
+              }
+              Write-Host "Push failed, retrying..."
+              Start-Sleep -Seconds 15
+              git fetch origin
+              git rebase origin/$(git rev-parse --abbrev-ref HEAD)
+            }
+            
+            if (-not $success) {
+              git push origin HEAD --force-with-lease
+            }
+          } else {
+            Write-Host "Nothing to upload."
+          }
